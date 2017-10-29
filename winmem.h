@@ -1,7 +1,13 @@
+#include <stddef.h>
 
 typedef enum _AccessType {
-    Read = 0x1,
-    Write = 0x2,
-    Execute = 0x4
+    ReadAccess = 0x1,
+    WriteAccess = 0x2,
+    ExecuteAccess = 0x4
 } AccessType;
 
+void win_init ();
+void win_deinit ();
+
+void* win_alloc (AccessType type, size_t n);
+void win_free (AccessType type, void* memptr);
