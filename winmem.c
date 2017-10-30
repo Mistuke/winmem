@@ -6,7 +6,7 @@
 
 #include "winmem.h"
 
-#if MEM_DEBUG
+#ifdef MEM_DEBUG
 #include <stdio.h>
 #define IF_DEBUG(X) X
 #else
@@ -26,6 +26,7 @@ typedef struct _PoolBuffer
   void* buffer;
   pool_t m_pool;
   tlsf_t m_alloc;
+  uint64_t m_flags;
   struct _PoolBuffer* next;
 } PoolBuffer;
 
@@ -43,8 +44,23 @@ static tlsf_t mem_manager[NUM_ACCESS];
 static PoolBuffer* buffers = NULL;
 
 const int pool_resize_limit = 10;
-const int default_pages_allocate = 15;
+const int default_blocks_allocate = 15;
 static bool initialized = false;
+static bool m_enforcing_mem_protect = false;
+
+size_t getAllocationSize (void)
+{
+  static size_t allocsize = 0;
+
+  if (allocsize == 0) {
+      SYSTEM_INFO sSysInfo;
+      GetSystemInfo(&sSysInfo);
+      allocsize = sSysInfo.dwAllocationGranularity;
+      IF_DEBUG (printf("** allocsize: %zu bytes\n", allocsize));
+  }
+
+  return allocsize;
+}
 
 size_t getPageSize (void)
 {
@@ -54,7 +70,7 @@ size_t getPageSize (void)
       SYSTEM_INFO sSysInfo;
       GetSystemInfo(&sSysInfo);
       pagesize = sSysInfo.dwPageSize;
-      IF_DEBUG (printf("** pagesize: %zu\n", pagesize));
+      IF_DEBUG (printf("** pagesize: %zu bytes\n", pagesize));
   }
 
   return pagesize;
@@ -70,7 +86,8 @@ uint64_t findManager (AccessType type)
   return -1;
 }
 
-void addPoolBuffer (size_t size, void* buffer, pool_t pool, tlsf_t manager)
+void addPoolBuffer (size_t size, void* buffer, pool_t pool, tlsf_t manager,
+                    uint64_t flags)
 {
   PoolBuffer* m_buffer = malloc (sizeof(PoolBuffer));
   assert (m_buffer);
@@ -79,6 +96,7 @@ void addPoolBuffer (size_t size, void* buffer, pool_t pool, tlsf_t manager)
   m_buffer->m_pool  = pool;
   m_buffer->m_alloc = manager;
   m_buffer->next    = buffers;
+  m_buffer->m_flags = flags;
   buffers = m_buffer;
   IF_DEBUG (printf (" $ Pool created. { size=%zu, buffer=%p, pool=%p, manager=%p } \n", size, buffer, pool, manager));
 }
@@ -114,20 +132,32 @@ void win_deinit ()
   IF_DEBUG (printf ("** memory manager un-initialized.\n"));
 }
 
+static size_t getPageAlignedSize (size_t n)
+{
+  size_t pageSize = getPageSize ();
+  int pages = n / pageSize;
+  int overflow = pages * pageSize;
+  if (n > overflow)
+    pages++;
+  return pages * pageSize;
+}
+
 static size_t getAllocSize (size_t requested)
 {
   size_t overhead = tlsf_size() + tlsf_pool_overhead()
                   + tlsf_alloc_overhead();
-  size_t pageSize = getPageSize ();
-  size_t gAlloc = pageSize * default_pages_allocate;
-  if (requested > (gAlloc - overhead)) {
-    gAlloc = requested + overhead;
-    // Now round up to next page size.
-    int pages = gAlloc / pageSize;
-    int overflow = pages * pageSize;
+  size_t paged_overhead = getPageAlignedSize (overhead);
+  IF_DEBUG (printf ("** tlsf overhead %zu bytes, paged: %zu.\n", overhead, paged_overhead));
+  size_t allocsize = getAllocationSize ();
+  size_t gAlloc = allocsize * default_blocks_allocate;
+  if (requested > (gAlloc - paged_overhead)) {
+    gAlloc = requested + paged_overhead;
+    /* Now round up to next page size to keep aligned to the page boundary.  */
+    int pages = gAlloc / allocsize;
+    int overflow = pages * allocsize;
     if (gAlloc > overflow)
       pages++;
-    gAlloc = pages * pageSize;
+    gAlloc = pages * allocsize;
   }
 
   return gAlloc;
@@ -148,6 +178,11 @@ void* win_alloc (AccessType type, size_t n)
   uint64_t index = findManager (type);
   tlsf_t manager = mem_manager[index];
 
+  size_t overhead = tlsf_size() + tlsf_pool_overhead()
+                  + tlsf_alloc_overhead();
+  size_t paged_overhead = getPageAlignedSize (overhead);
+  size_t offset_overhead = paged_overhead - overhead;
+
   if (!manager) {
     size_t m_size = getAllocSize (n);
     uint64_t m_protect = getProtection (type);
@@ -156,11 +191,14 @@ void* win_alloc (AccessType type, size_t n)
     if (!cache)
       return NULL;
 
-    manager = tlsf_create_with_pool (cache, m_size);
+    /* Note: Abort if this fails when added to GHC.  */
+    DWORD old_flags;
+    VirtualProtect (cache, paged_overhead, PAGE_READWRITE, &old_flags);
+    manager = tlsf_create_with_pool (cache + offset_overhead, m_size - offset_overhead);
     assert (manager);
     pool_t m_pool = tlsf_get_pool (manager);
     mem_manager[index] = manager;
-    addPoolBuffer (m_size, cache, m_pool, manager);
+    addPoolBuffer (m_size, cache, m_pool, manager, m_protect);
     IF_DEBUG (printf ("- new manager %p created with size %zu (%zu) with pool %p at %p with protection %llu.\n",
                       manager, m_size, n, m_pool, cache, m_protect));
   }
@@ -176,10 +214,17 @@ void* win_alloc (AccessType type, size_t n)
     if (!cache)
       return NULL;
 
-    pool_t m_pool = tlsf_add_pool (manager, cache, m_size);
-    addPoolBuffer (m_size, cache, m_pool, manager);
+    /* Note: Abort if this fails when added to GHC.  */
+    DWORD old_flags;
+    VirtualProtect (cache, paged_overhead, PAGE_READWRITE, &old_flags);
+    pool_t m_pool = tlsf_add_pool (manager, cache + offset_overhead, m_size - offset_overhead);
+    addPoolBuffer (m_size, cache, m_pool, manager, m_protect);
     result = tlsf_malloc (manager, n);
+    IF_DEBUG (printf ("- resized manager %p adding %zu bytes (%zu) with pool %p at %p with protection %llu.\n",
+    manager, m_size, n, m_pool, cache, m_protect));
   }
+
+  IF_DEBUG (printf ("-> allocated %zu bytes.\n", n));
 
   return result;
 }
