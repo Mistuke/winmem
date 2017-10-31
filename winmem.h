@@ -11,3 +11,6 @@ void win_deinit ();
 
 void* win_alloc (AccessType type, size_t n);
 void win_free (AccessType type, void* memptr);
+
+void win_memory_unprotect ();
+void win_memory_protect ();

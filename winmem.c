@@ -95,8 +95,8 @@ void addPoolBuffer (size_t size, void* buffer, pool_t pool, tlsf_t manager,
   m_buffer->buffer  = buffer;
   m_buffer->m_pool  = pool;
   m_buffer->m_alloc = manager;
-  m_buffer->next    = buffers;
   m_buffer->m_flags = flags;
+  m_buffer->next    = buffers;
   buffers = m_buffer;
   IF_DEBUG (printf (" $ Pool created. { size=%zu, buffer=%p, pool=%p, manager=%p } \n", size, buffer, pool, manager));
 }
@@ -175,6 +175,9 @@ static uint64_t getProtection (AccessType type)
 
 void* win_alloc (AccessType type, size_t n)
 {
+  if (!initialized)
+    return NULL;
+
   uint64_t index = findManager (type);
   tlsf_t manager = mem_manager[index];
 
@@ -187,13 +190,12 @@ void* win_alloc (AccessType type, size_t n)
     size_t m_size = getAllocSize (n);
     uint64_t m_protect = getProtection (type);
     void* cache
-      = VirtualAlloc (NULL, m_size, MEM_COMMIT | MEM_RESERVE, m_protect);
+      = VirtualAlloc (NULL, m_size, MEM_COMMIT | MEM_RESERVE,
+            m_enforcing_mem_protect ? m_protect : PAGE_EXECUTE_READWRITE);
     if (!cache)
       return NULL;
 
     /* Note: Abort if this fails when added to GHC.  */
-    DWORD old_flags;
-    VirtualProtect (cache, paged_overhead, PAGE_READWRITE, &old_flags);
     manager = tlsf_create_with_pool (cache + offset_overhead, m_size - offset_overhead);
     assert (manager);
     pool_t m_pool = tlsf_get_pool (manager);
@@ -210,13 +212,11 @@ void* win_alloc (AccessType type, size_t n)
     size_t m_size = getAllocSize (n);
     uint64_t m_protect = getProtection (type);
     void* cache
-      = VirtualAlloc (NULL, m_size, MEM_COMMIT | MEM_RESERVE, m_protect);
+      = VirtualAlloc (NULL, m_size, MEM_COMMIT | MEM_RESERVE,
+            m_enforcing_mem_protect ? m_protect : PAGE_EXECUTE_READWRITE);
     if (!cache)
       return NULL;
 
-    /* Note: Abort if this fails when added to GHC.  */
-    DWORD old_flags;
-    VirtualProtect (cache, paged_overhead, PAGE_READWRITE, &old_flags);
     pool_t m_pool = tlsf_add_pool (manager, cache + offset_overhead, m_size - offset_overhead);
     addPoolBuffer (m_size, cache, m_pool, manager, m_protect);
     result = tlsf_malloc (manager, n);
@@ -231,9 +231,42 @@ void* win_alloc (AccessType type, size_t n)
 
 void win_free (AccessType type, void* memptr)
 {
+  if (!initialized)
+    return;
+
   uint64_t index = findManager (type);
   tlsf_t manager = mem_manager[index];
   assert (manager);
   tlsf_free (manager, memptr);
   IF_DEBUG (printf ("- freed %p of type %d from manager %p.\n", memptr, type, manager));
+}
+
+void win_memory_protect ()
+{
+  if (!initialized)
+    return;
+
+  m_enforcing_mem_protect = true;
+
+  for (PoolBuffer* b = buffers; b; b = b->next ) {
+    IF_DEBUG (printf (" $ pool %p protected (0x%llx) in manager %p.\n", b->m_pool, b->m_flags, b->m_alloc));
+    /* Note: Abort if this fails when added to GHC.  */
+    DWORD old_flags;
+    VirtualProtect (b->buffer, b->size, b->m_flags, &old_flags);
+  }
+}
+
+void win_memory_unprotect ()
+{
+  if (!initialized)
+    return;
+
+  m_enforcing_mem_protect = false;
+
+  for (PoolBuffer* b = buffers; b; b = b->next) {
+    IF_DEBUG (printf (" $ pool %p un-protected (RW) in manager %p.\n", b->m_pool, b->m_alloc));
+    /* Note: Abort if this fails when added to GHC.  */
+    DWORD old_flags;
+    VirtualProtect (b->buffer, b->size, PAGE_EXECUTE_READWRITE, &old_flags);
+  }
 }
