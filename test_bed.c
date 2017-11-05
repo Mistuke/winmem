@@ -1,6 +1,7 @@
 #include "winmem.h"
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 int main()
 {
@@ -10,10 +11,10 @@ int main()
 
   printf ("@ Creating ReadWrite area.\n\n");
   p = win_alloc (WriteAccess, 1882384);
+  assert (p);
   win_free (WriteAccess, p);
   p = win_alloc (WriteAccess, 46);
-
-  win_memory_protect ();
+  assert (p);
 
   printf ("@ Writing 40 bytes to RW area.\n\n");
   memset (p, 0xFF, 40);
@@ -23,6 +24,7 @@ int main()
 
   printf ("@ Creating Read-only area.\n\n");
   p = win_alloc (ReadAccess, 1234);
+  assert (p);
   win_memory_protect ();
 
   printf ("@ Writing 40 bytes to R area (should crash).\n\n");
